@@ -1,0 +1,39 @@
+--- a/lib/http_request.c
++++ b/lib/http_request.c
+@@ -31,6 +31,7 @@
+     const char *method;
+     char *url;
+     char protocol[9];
++    const char *chunk_end;   /* one past the last byte delivered to llhttp_execute() in the current call */
+ 
+     char **headers;
+     int headers_size;
+@@ -54,7 +55,19 @@
+     request->url[urllen] = '\0';
+     strncat(request->url, at, length);
+ 
+-    strncpy(request->protocol, at + length + 1, 8);
++    /* The protocol token ("RTSP/1.0" etc.) normally follows right after the URL in the same request line.
++     * That is only true if the whole request line arrived in a single read(); a client that splits the
++     * line across two writes (URL in one, " RTSP/1.0\r\n" in the next) would otherwise make this read
++     * past the data actually delivered in this llhttp_execute() call, returning stale bytes left over
++     * from a previous, unrelated connection that reused the same receive buffer. Clamp to what is
++     * actually available in the current chunk instead. */
++    memset(request->protocol, 0, sizeof(request->protocol));
++    const char *proto_start = at + length + 1;
++    if (request->chunk_end && proto_start < request->chunk_end) {
++        size_t avail = (size_t) (request->chunk_end - proto_start);
++        size_t n = avail < sizeof(request->protocol) - 1 ? avail : sizeof(request->protocol) - 1;
++        memcpy(request->protocol, proto_start, n);
++    }
+ 
+     return 0;
+ }
+@@ -182,6 +195,7 @@
+ {
+     assert(request);
+ 
++    request->chunk_end = data + datalen;
+     int ret = llhttp_execute(&request->parser, data, datalen);
+ 
+     /* support for "Upgrade" to reverse http ("PTTH/1.0") protocol */

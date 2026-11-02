@@ -1,0 +1,49 @@
+--- a/lib/raop_handlers.h
++++ b/lib/raop_handlers.h
+@@ -399,9 +399,16 @@
+         unsigned char epk[ED25519_KEY_SIZE];
+         unsigned char authtag[GCM_AUTHTAG_SIZE];
+         int ret = 0;
+-        plist_get_data_val(req_epk_node, &client_epk, &client_epk_len); 
++        plist_get_data_val(req_epk_node, &client_epk, &client_epk_len);
+         plist_get_data_val(req_authtag_node, &client_authtag, &client_authtag_len);
+ 
++        if (client_epk_len != ED25519_KEY_SIZE || client_authtag_len != GCM_AUTHTAG_SIZE) {
++            logger_log(raop->logger, LOGGER_ERR, "Client Authentication Failure (epk/authTag length invalid: %d/%d)",
++                       (int) client_epk_len, (int) client_authtag_len);
++            free(client_epk); free(client_authtag); plist_free(req_root_node);
++            goto authentication_failed;
++        }
++
+         if (logger_debug) {
+             char *str = utils_data_to_string((const unsigned char *) client_epk, client_epk_len, 16);
+             logger_log(raop->logger, LOGGER_DEBUG, "client_epk %d:\n%s\n", (int) client_epk_len, str);
+@@ -781,8 +788,14 @@
+         }
+ 
+         plist_get_data_val(req_eiv_node, &eiv, &eiv_len);
++        if (eiv_len != 16) {
++            logger_log(raop->logger, LOGGER_ERR, "Invalid SETUP data (eiv length %llu, expected 16)", eiv_len);
++            free(eiv);
++            plist_free(res_root_node); plist_free(req_root_node);
++            return;
++        }
+         memcpy(aesiv, eiv, 16);
+-        free(eiv);	
++        free(eiv);
+         logger_log(raop->logger, LOGGER_DEBUG, "eiv_len = %llu", eiv_len);
+         if (logger_debug) {
+             char* str = utils_data_to_string(aesiv, 16, 16);
+@@ -793,6 +806,12 @@
+         char* ekey = NULL;
+         uint64_t ekey_len = 0;
+         plist_get_data_val(req_ekey_node, &ekey, &ekey_len);
++        if (ekey_len != 72) {
++            logger_log(raop->logger, LOGGER_ERR, "Invalid SETUP data (ekey length %llu, expected 72)", ekey_len);
++            free(ekey);
++            plist_free(res_root_node); plist_free(req_root_node);
++            return;
++        }
+         memcpy(eaeskey,ekey,72);
+         free(ekey);
+         logger_log(raop->logger, LOGGER_DEBUG, "ekey_len = %llu", ekey_len);

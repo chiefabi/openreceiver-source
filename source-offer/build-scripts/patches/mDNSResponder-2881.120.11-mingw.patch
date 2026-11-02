@@ -1,0 +1,114 @@
+diff --git a/mDNSCore/mdns_strict.h b/mDNSCore/mdns_strict.h
+index 9e7f9e9..7303ec1 100644
+--- a/mDNSCore/mdns_strict.h
++++ b/mDNSCore/mdns_strict.h
+@@ -118,7 +118,7 @@
+ 	_MDNS_STRICT_DISPOSE_TEMPLATE(obj, free)
+ 
+ static
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(__GNUC__)
+ __forceinline
+ void _mdns_strict_strlcpy(char * const dst, const char * const src, const size_t dst_len)
+ #else
+diff --git a/mDNSShared/CommonServices.h b/mDNSShared/CommonServices.h
+index 7efb077..d148a68 100644
+--- a/mDNSShared/CommonServices.h
++++ b/mDNSShared/CommonServices.h
+@@ -447,7 +447,7 @@ typedef int socklen_t;
+ // - Mac OS X when not building with BSD headers
+ // - Windows
+ 
+-#if ( !defined(_SSIZE_T) && ( TARGET_OS_WIN32 || !defined( _BSD_SSIZE_T_DEFINED_ ) ) && !TARGET_OS_FREEBSD && !TARGET_OS_LINUX && !TARGET_OS_MAC)
++#if ( !defined(__MINGW32__) && !defined(_SSIZE_T) && ( TARGET_OS_WIN32 || !defined( _BSD_SSIZE_T_DEFINED_ ) ) && !TARGET_OS_FREEBSD && !TARGET_OS_LINUX && !TARGET_OS_MAC)
+ typedef int ssize_t;
+ #endif
+ 
+diff --git a/mDNSShared/dnssd_clientstub.c b/mDNSShared/dnssd_clientstub.c
+index 7f4647c..7599e27 100644
+--- a/mDNSShared/dnssd_clientstub.c
++++ b/mDNSShared/dnssd_clientstub.c
+@@ -68,6 +68,7 @@ extern BOOL IsSystemServiceDisabled();
+ 
+ static int g_initWinsock = 0;
+     #define LOG_WARNING kDebugLevelWarning
++    #define LOG_ERR kDebugLevelError
+     #define LOG_INFO kDebugLevelInfo
+ static void syslog( int priority, const char * message, ...)
+ {
+@@ -845,7 +846,7 @@ static DNSServiceErrorType ConnectToServer(DNSServiceRef *ref, DNSServiceFlags f
+         #if defined(USE_TCP_LOOPBACK)
+         saddr.sin_family      = AF_INET;
+         saddr.sin_addr.s_addr = inet_addr(MDNS_TCP_SERVERADDR);
+-        saddr.sin_port        = IsSystemServiceDisabled() ? htons(MDNS_TCP_SERVERPORT_CENTENNIAL) : htons(MDNS_TCP_SERVERPORT);
++        saddr.sin_port        = htons(MDNS_TCP_SERVERPORT);   /* same port as the Bonjour service and as mDNSResponder.exe -server */
+         #else
+         saddr.sun_family      = AF_LOCAL;
+         SetUDSPath(&saddr, uds_serverpath);
+diff --git a/mDNSShared/dnssd_ipc.h b/mDNSShared/dnssd_ipc.h
+index d5d396c..46364ea 100644
+--- a/mDNSShared/dnssd_ipc.h
++++ b/mDNSShared/dnssd_ipc.h
+@@ -79,7 +79,9 @@ extern char *win32_strerror(int inErrorCode);
+ #ifdef WIN32_CENTENNIAL
+ #   define MDNS_TCP_SERVERPORT_CENTENNIAL  53545
+ #endif
++#   ifndef MDNS_TCP_SERVERPORT
+ #   define MDNS_TCP_SERVERPORT  5354
++#   endif
+ #   define LISTENQ              5
+ #   define dnssd_sockaddr_t     struct sockaddr_in
+ #else
+diff --git a/mDNSShared/uds_daemon.h b/mDNSShared/uds_daemon.h
+index 4153a65..f18b510 100644
+--- a/mDNSShared/uds_daemon.h
++++ b/mDNSShared/uds_daemon.h
+@@ -79,7 +79,7 @@ typedef struct browser_t
+ 
+ #ifdef _WIN32
+ # ifdef __MINGW32__
+-typedef int pid_t;
++/* pid_t comes from the MinGW headers */
+ typedef int socklen_t;
+ # else
+ typedef unsigned int pid_t;
+diff --git a/mDNSWindows/PosixCompat.c b/mDNSWindows/PosixCompat.c
+index 55275c2..0050601 100644
+--- a/mDNSWindows/PosixCompat.c
++++ b/mDNSWindows/PosixCompat.c
+@@ -79,7 +79,7 @@ if_indextoname_win( unsigned ifindex, char * ifname )
+ int
+ gettimeofday( struct timeval * tv, struct timezone * tz )
+ {
+-#define EPOCHFILETIME (116444736000000000i64)
++#define EPOCHFILETIME (116444736000000000ULL)
+ 
+ 	if ( tv != NULL )
+ 	{
+diff --git a/mDNSWindows/PosixCompat.h b/mDNSWindows/PosixCompat.h
+index dc16a25..3e19ab3 100644
+--- a/mDNSWindows/PosixCompat.h
++++ b/mDNSWindows/PosixCompat.h
+@@ -25,7 +25,9 @@
+ /* 
+  * Posix process compatibility
+  */
++#if !defined(__MINGW32__)
+ typedef int pid_t;
++#endif
+ #if !defined( getpid )
+ #	define getpid _getpid
+ #endif
+diff --git a/mDNSWindows/mDNSWin32.c b/mDNSWindows/mDNSWin32.c
+index f647397..317371d 100644
+--- a/mDNSWindows/mDNSWin32.c
++++ b/mDNSWindows/mDNSWin32.c
+@@ -1574,7 +1574,7 @@ mDNSexport mDNSBool mDNSPlatformValidRecordForInterface(const AuthRecord *rr, mD
+ 	return mDNStrue;
+ }
+  
+-mDNSexport mDNSBool mDNSPlatformValidQuestionForInterface(DNSQuestion *q, const NetworkInterfaceInfo *intf)
++mDNSexport mDNSBool mDNSPlatformValidQuestionForInterface(const DNSQuestion *q, const NetworkInterfaceInfo *intf)
+ {
+ 	DEBUG_UNUSED( q );
+ 	DEBUG_UNUSED( intf );

@@ -1,0 +1,197 @@
+diff -ruN base/CMakeLists.txt UxPlay-1.73.7/CMakeLists.txt
+--- base/CMakeLists.txt	2026-10-18 06:20:27.017658500 +0200
++++ UxPlay-1.73.7/CMakeLists.txt	2026-10-18 06:21:12.486497800 +0200
+@@ -59,7 +59,14 @@
+      message ( STATUS "define GST_MACOS" )
+ endif()
+ 
+-add_executable( uxplay uxplay.cpp )
++if ( WIN32 )
++  # icon and version information of uxplay.exe (the icon is also given to the video window, see -wt)
++  enable_language( RC )
++  set( CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} -I${CMAKE_CURRENT_SOURCE_DIR}" )
++  add_executable( uxplay uxplay.cpp uxplay.rc )
++else()
++  add_executable( uxplay uxplay.cpp )
++endif()
+ target_link_libraries( uxplay renderers airplay )
+ if (DBUS_FOUND)
+       target_link_libraries( uxplay ${DBUS_LIBRARY})
+diff -ruN base/uxplay.cpp UxPlay-1.73.7/uxplay.cpp
+--- base/uxplay.cpp	2026-10-18 06:20:26.444102200 +0200
++++ UxPlay-1.73.7/uxplay.cpp	2026-10-18 06:32:15.833246700 +0200
+@@ -41,6 +41,7 @@
+ #include <unordered_map>
+ #include <winsock2.h>
+ #include <iphlpapi.h>
++#include <shellapi.h>
+ #include <pthread.h>   //for pthreads in MSYS2 UCRT
+ #include "netstats.h"
+ #else
+@@ -110,6 +111,9 @@
+ static videoflip_t videoflip[2] = { NONE , NONE };
+ static bool use_video = true;
+ static bool net_stats_enabled = false;   /* -stats: print a STATS line (data rates) every second */
++#ifdef _WIN32
++static std::wstring window_title_w;      /* -wt <title>: title (and application icon) the process gives to its own video window */
++#endif
+ static unsigned char compression_type = 0;
+ static std::string audiosink = "autoaudiosink";
+ static int  audiodelay = -1;
+@@ -1195,6 +1199,28 @@
+     return true;
+ }
+ 
++#ifdef _WIN32
++/*
++ * A Windows program receives its command line converted to the legacy ANSI code page, but UxPlay expects UTF-8 (it rejects other
++ * strings, so a server name like "Buero-PC" with an umlaut would end the program at start). Rebuild the arguments from the
++ * Unicode command line as UTF-8.
++ */
++static char **utf8_arguments(int *argc_out) {
++    int wargc = 0;
++    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
++    if (!wargv) return NULL;
++    char **out = (char **) calloc(wargc + 1, sizeof(char *));
++    for (int k = 0; k < wargc; k++) {
++        int len = WideCharToMultiByte(CP_UTF8, 0, wargv[k], -1, NULL, 0, NULL, NULL);
++        out[k] = (char *) malloc(len > 0 ? len : 1);
++        if (len > 0) WideCharToMultiByte(CP_UTF8, 0, wargv[k], -1, out[k], len, NULL, NULL); else out[k][0] = 0;
++    }
++    LocalFree(wargv);
++    *argc_out = wargc;
++    return out;
++}
++#endif
++
+ static void parse_arguments (int argc, char *argv[]) {
+     // Parse arguments
+     for (int i = 1; i < argc; i++) {
+@@ -1361,6 +1387,16 @@
+             }
+         } else if (arg == "-a") {
+             use_audio = false;
++        } else if (arg == "-wt") {
++            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
++            i++;
++#ifdef _WIN32
++            {
++                wchar_t wbuf[256];
++                int n = MultiByteToWideChar(CP_UTF8, 0, argv[i], -1, wbuf, 256);
++                if (n > 0) window_title_w = wbuf;
++            }
++#endif
+         } else if (arg == "-stats") {
+             net_stats_enabled = true;
+         } else if (arg == "-d") {
+@@ -2229,6 +2265,54 @@
+ /* Data-rate statistics: one "STATS" line per second (read by the OpenReceiver user interface) */
+ static NetStats *net_stats = new NetStats();    /* never freed: also used while the process shuts down */
+ 
++#ifdef _WIN32
++/*
++ * Title and icon of the video window. The d3d11 video sink creates its window (class "GSTD3D11") with a fixed title and the
++ * default icon. The process gives its own window the title from -wt and the icon embedded in uxplay.exe (resource 1), so that
++ * no other program has to modify the window from outside.
++ */
++/* BRAND-BEGIN (this block is also compiled by tools/build-engine/tests/window_brand_test.cpp) */
++static BOOL CALLBACK brand_window_cb(HWND hwnd, LPARAM) {
++    static HWND branded = NULL;
++    static HICON icon_big = NULL, icon_small = NULL;
++    DWORD pid = 0;
++    GetWindowThreadProcessId(hwnd, &pid);
++    if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd)) return TRUE;
++    char cls[64] = {0};
++    if (!GetClassNameA(hwnd, cls, sizeof cls) || strcmp(cls, "GSTD3D11") != 0) return TRUE;
++    wchar_t cur[256] = {0};
++    GetWindowTextW(hwnd, cur, 256);
++    if (wcscmp(cur, window_title_w.c_str()) != 0) SetWindowTextW(hwnd, window_title_w.c_str());
++    if (hwnd != branded) {
++        HMODULE self = GetModuleHandleW(NULL);
++        if (!icon_big) icon_big = (HICON) LoadImageW(self, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
++        if (!icon_small) icon_small = (HICON) LoadImageW(self, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
++        if (icon_big) SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM) icon_big);
++        if (icon_small) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM) icon_small);
++        branded = hwnd;
++    }
++    return TRUE;
++}
++
++static void *brand_window_thread(void *) {
++    for (;;) {
++        Sleep(500);
++        EnumWindows(brand_window_cb, 0);
++    }
++    return NULL;
++}
++/* BRAND-END */
++
++/* In the detailed log (-d) stdout is buffered for speed; flush it ten times a second so a program reading the pipe is never far behind. */
++static void *flush_stdout_thread(void *) {
++    for (;;) {
++        Sleep(100);
++        fflush(stdout);
++    }
++    return NULL;
++}
++#endif
++
+ static void *net_stats_thread(void *) {
+     uint64_t last = get_local_time();
+     for (;;) {
+@@ -2913,6 +2997,9 @@
+ #else
+ int main (int argc, char *argv[]) {
+ #endif
++#ifdef _WIN32
++    argv = utf8_arguments(&argc);   /* UxPlay expects UTF-8 arguments (e.g. server names with umlauts) */
++#endif
+     std::vector<char> server_hw_addr;
+     std::string config_file = "";
+ 
+@@ -2985,6 +3072,13 @@
+     SetConsoleOutputCP(CP_UTF8);
+     if (!debug_log) {
+         setbuf(stdout, NULL);
++    } else {
++        pthread_t flush_tid;
++        if (pthread_create(&flush_tid, NULL, flush_stdout_thread, NULL) == 0) pthread_detach(flush_tid);
++    }
++    if (!window_title_w.empty() && use_video) {
++        pthread_t brand_tid;
++        if (pthread_create(&brand_tid, NULL, brand_window_thread, NULL) == 0) pthread_detach(brand_tid);
+     }
+ #endif
+ 
+diff -ruN base/uxplay.rc UxPlay-1.73.7/uxplay.rc
+--- base/uxplay.rc	1970-01-01 01:00:00.000000000 +0100
++++ UxPlay-1.73.7/uxplay.rc	2026-10-18 06:21:12.520278200 +0200
+@@ -0,0 +1,28 @@
++/* Resources of uxplay.exe (Windows): icon (app.ico is copied next to this file by build-uxplay.sh) and version information. */
++#include <winver.h>
++1 ICON "app.ico"
++1 VERSIONINFO
++ FILEVERSION 1,73,7,0
++ PRODUCTVERSION 1,73,7,0
++ FILEOS VOS_NT_WINDOWS32
++ FILETYPE VFT_APP
++BEGIN
++  BLOCK "StringFileInfo"
++  BEGIN
++    BLOCK "040704b0"
++    BEGIN
++      VALUE "CompanyName", "UxPlay authors"
++      VALUE "FileDescription", "Engine of OpenReceiver (UxPlay, mirrors an iPhone screen)"
++      VALUE "FileVersion", "1.73.7"
++      VALUE "InternalName", "uxplay"
++      VALUE "LegalCopyright", "GPL-3.0-or-later, see licenses folder"
++      VALUE "OriginalFilename", "uxplay.exe"
++      VALUE "ProductName", "OpenReceiver"
++      VALUE "ProductVersion", "1.73.7"
++    END
++  END
++  BLOCK "VarFileInfo"
++  BEGIN
++    VALUE "Translation", 0x407, 1200
++  END
++END

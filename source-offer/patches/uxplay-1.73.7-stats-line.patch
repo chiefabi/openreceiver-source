@@ -1,0 +1,286 @@
+diff -ruN pa/lib/raop.h pb/lib/raop.h
+--- pa/lib/raop.h	2026-10-14 22:09:55.317503400 +0200
++++ pb/lib/raop.h	2026-10-14 22:09:55.404666400 +0200
+@@ -120,6 +120,7 @@
+ airplay_video_t *airplay_video_init(raop_t *raop, unsigned short port, const char *lang);
+ char *raop_get_lang(raop_t *raop);
+ uint64_t get_local_time();
++extern unsigned long long raop_stat_resend_requests, raop_stat_resend_empty, raop_stat_gaps_skipped;
+ void raop_handle_eos(raop_t *raop);
+ 
+ RAOP_API raop_t *raop_init(raop_callbacks_t *callbacks);
+diff -ruN pa/lib/raop_buffer.c pb/lib/raop_buffer.c
+--- pa/lib/raop_buffer.c	2026-10-14 22:09:55.166017100 +0200
++++ pb/lib/raop_buffer.c	2026-10-14 22:09:55.396636500 +0200
+@@ -34,6 +34,7 @@
+ #include "byteutils.h"
+ 
+ #define RAOP_BUFFER_LENGTH 256
++extern unsigned long long raop_stat_gaps_skipped;   /* raop_rtp.c */
+ #define RAOP_RESEND_MAX_TRIES 30   /* resend requests for the same missing packet before giving up on it */
+ 
+ typedef struct {
+@@ -343,6 +344,7 @@
+                 logger_log(raop_buffer->logger, LOGGER_DEBUG, "giving up resend of %u packets from seqnum=%u",
+                            count, raop_buffer->first_seqnum);
+                 unsigned short first = raop_buffer->first_seqnum;
++                raop_stat_gaps_skipped += count;
+                 for (unsigned short i = 0; i < count; i++) {
+                     raop_buffer_enqueue_empty(raop_buffer, first + i);
+                 }
+diff -ruN pa/lib/raop_rtp.c pb/lib/raop_rtp.c
+--- pa/lib/raop_rtp.c	2026-10-14 22:09:55.519146400 +0200
++++ pb/lib/raop_rtp.c	2026-10-14 22:09:55.383622200 +0200
+@@ -196,6 +196,11 @@
+     }
+ }
+ 
++/* running totals for the STATS line printed by uxplay (see netstats.h) */
++unsigned long long raop_stat_resend_requests = 0;
++unsigned long long raop_stat_resend_empty = 0;
++unsigned long long raop_stat_gaps_skipped = 0;
++
+ static int
+ raop_rtp_resend_callback(void *opaque, unsigned short seqnum, unsigned short count)
+ {
+@@ -210,6 +215,7 @@
+     addrlen = raop_rtp->control_saddr_len;
+ 
+     logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp got resend request %d %d", seqnum, count);
++    raop_stat_resend_requests++;
+     ourseqnum = raop_rtp->control_seqnum++;
+ 
+     /* Fill the request buffer */
+@@ -470,6 +476,7 @@
+                 if (resent_packetlen == 12 || (resent_packetlen == 16 && memcmp(resent_packet + 12, no_data_marker, 4) == 0)) {
+                     /* the sender never sent this packet (e.g. during a pause): stop waiting for it */
+                     logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp resent audio packet is empty: seqnum=%u", seqnum);
++                    raop_stat_resend_empty++;
+                     raop_buffer_enqueue_empty(raop_rtp->buffer, seqnum);
+                 } else if (resent_packetlen >= 12) {
+                     logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp resent audio packet: seqnum=%u", seqnum);
+diff -ruN pa/netstats.h pb/netstats.h
+--- pa/netstats.h	1970-01-01 01:00:00.000000000 +0100
++++ pb/netstats.h	2026-10-14 22:12:20.589945900 +0200
+@@ -0,0 +1,79 @@
++/*
++ * netstats.h - einfache Zähler für Datenraten (Video, Ton, Wiederholungs-Anfragen, verworfene Bilder).
++ * Einmal pro Sekunde entsteht daraus eine "STATS"-Zeile, die von der Oberfläche des OpenReceiver
++ * ausgewertet wird (Fehlersuche bei hängendem Bild).
++ *
++ * Felder: c=Verbindungen, vf/vk=Video Bilder/s und kbit/s, vmin/vavg=Reserve (kleinste/mittlere) in ms, af/ak=Ton Pakete/s
++ * und kbit/s, amin/aavg=Reserve, rs=Wiederholungs-Anfragen, re=leere Antworten darauf, gp=aufgegebene Lücken,
++ * ds/dd=verworfene Bilder (Videosenke/Decoder). Die Zeile bleibt unter 110 Zeichen (Konsolenbreite 120).
++ *
++ * Reserve in Millisekunden, mit der ein Paket VOR seiner Anzeigezeit eintrifft (positiv = rechtzeitig,
++ * negativ = zu spät). Sinkt sie unter 0, werden Bilder bzw. Ton zu spät und können verworfen werden.
++ */
++#ifndef NETSTATS_H
++#define NETSTATS_H
++
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <mutex>
++#include <climits>
++
++class NetStats {
++public:
++    struct Window {
++        uint64_t count = 0, bytes = 0, marg_n = 0;
++        int64_t marg_min = INT64_MAX, marg_sum = 0;
++        void add(uint64_t nbytes, int64_t margin_ns) {
++            count++; bytes += nbytes;
++            int64_t ms = margin_ns / 1000000;
++            marg_n++; marg_sum += ms; if (ms < marg_min) marg_min = ms;
++        }
++    };
++
++    void video(uint64_t bytes, int64_t margin_ns) { std::lock_guard<std::mutex> g(m_); v_.add(bytes, margin_ns); }
++    void audio(uint64_t bytes, int64_t margin_ns) { std::lock_guard<std::mutex> g(m_); a_.add(bytes, margin_ns); }
++
++    /*
++     * Liefert die STATS-Zeile für das vergangene Intervall und beginnt ein neues. Die übrigen Werte sind laufende
++     * Gesamtzahlen; daraus werden die Änderungen im Intervall berechnet. Leere Zeichenkette, wenn nichts los war.
++     */
++    std::string line(double seconds, uint64_t resend_total, uint64_t resend_empty_total, uint64_t gaps_skipped_total,
++                     uint64_t drop_sink_total, uint64_t drop_dec_total, unsigned conns) {
++        Window v, a;
++        { std::lock_guard<std::mutex> g(m_); v = v_; a = a_; v_ = Window(); a_ = Window(); }
++        uint64_t d_resend = delta(resend_total, p_resend_), d_empty = delta(resend_empty_total, p_empty_),
++                 d_gaps = delta(gaps_skipped_total, p_gaps_), d_sink = delta(drop_sink_total, p_sink_),
++                 d_dec = delta(drop_dec_total, p_dec_);
++        bool quiet = v.count == 0 && a.count == 0 && d_resend == 0 && d_empty == 0 && d_gaps == 0 && d_sink == 0 && d_dec == 0;
++        if (seconds <= 0.0 || (conns == 0 && quiet)) return std::string();
++
++        char vm[48], am[48], buf[512];
++        fmt_margin(vm, sizeof vm, "v", v); fmt_margin(am, sizeof am, "a", a);
++        snprintf(buf, sizeof buf,
++                 "STATS c=%u vf=%.1f vk=%.0f %s af=%.1f ak=%.0f %s rs=%llu re=%llu gp=%llu ds=%llu dd=%llu",
++                 conns, v.count / seconds, v.bytes * 8.0 / 1000.0 / seconds, vm,
++                 a.count / seconds, a.bytes * 8.0 / 1000.0 / seconds, am,
++                 (unsigned long long) d_resend, (unsigned long long) d_empty, (unsigned long long) d_gaps,
++                 (unsigned long long) d_sink, (unsigned long long) d_dec);
++        return std::string(buf);
++    }
++
++private:
++    static uint64_t delta(uint64_t total, uint64_t &prev) {
++        uint64_t d = total >= prev ? total - prev : total;   // Zähler wurde zurückgesetzt: neu beginnen
++        prev = total;
++        return d;
++    }
++    static void fmt_margin(char *out, size_t n, const char *prefix, const Window &w) {
++        if (w.marg_n == 0) { snprintf(out, n, "%smin=na %savg=na", prefix, prefix); return; }
++        snprintf(out, n, "%smin=%lld %savg=%lld", prefix, (long long) w.marg_min, prefix,
++                 (long long) (w.marg_sum / (int64_t) w.marg_n));
++    }
++
++    std::mutex m_;
++    Window v_, a_;
++    uint64_t p_resend_ = 0, p_empty_ = 0, p_gaps_ = 0, p_sink_ = 0, p_dec_ = 0;
++};
++
++#endif /* NETSTATS_H */
+diff -ruN pa/renderers/video_renderer.c pb/renderers/video_renderer.c
+--- pa/renderers/video_renderer.c	2026-10-14 22:09:55.211369500 +0200
++++ pb/renderers/video_renderer.c	2026-10-14 22:09:55.442257000 +0200
+@@ -810,6 +810,13 @@
+     } 
+ }
+ 
++static unsigned int qos_dropped_sink = 0, qos_dropped_decoder = 0;
++
++void video_renderer_get_drops(unsigned int *sink, unsigned int *decoder) {
++    *sink = g_atomic_int_get(&qos_dropped_sink);
++    *decoder = g_atomic_int_get(&qos_dropped_decoder);
++}
++
+ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *message, void *loop) {
+     GstState old_state, new_state;
+     const gchar no_state[] = "";
+@@ -1032,6 +1039,23 @@
+         }
+         break;
+ #endif
++    case GST_MESSAGE_QOS:
++        {
++            /* the dropped counters are running totals of the reporting element (sink or decoder) */
++            GstFormat qos_format;
++            guint64 qos_processed = 0, qos_dropped = 0;
++            gst_message_parse_qos_stats(message, &qos_format, &qos_processed, &qos_dropped);
++            if (qos_dropped != (guint64) -1 && GST_IS_ELEMENT(GST_MESSAGE_SRC(message))) {
++                GstElementFactory *factory = gst_element_get_factory(GST_ELEMENT(GST_MESSAGE_SRC(message)));
++                const gchar *klass = factory ? gst_element_factory_get_metadata(factory, GST_ELEMENT_METADATA_KLASS) : NULL;
++                if (klass && strstr(klass, "Decoder")) {
++                    g_atomic_int_set(&qos_dropped_decoder, (unsigned int) qos_dropped);
++                } else {
++                    g_atomic_int_set(&qos_dropped_sink, (unsigned int) qos_dropped);
++                }
++            }
++        }
++        break;
+     default:
+       /* unhandled message */
+         break;
+diff -ruN pa/renderers/video_renderer.h pb/renderers/video_renderer.h
+--- pa/renderers/video_renderer.h	2026-10-14 22:09:55.218933100 +0200
++++ pb/renderers/video_renderer.h	2026-10-14 22:09:55.455279200 +0200
+@@ -63,6 +63,8 @@
+ int video_renderer_cycle ();
+ bool video_renderer_is_paused();
+ bool video_renderer_eos_watch();
++/* frames dropped (running totals, from GStreamer QoS messages): by the video sink / by the decoder */
++void video_renderer_get_drops (unsigned int *sink, unsigned int *decoder);
+ uint64_t  video_renderer_render_buffer (unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time);
+ void video_renderer_display_jpeg(const void *data, int *data_len);
+ void video_renderer_flush ();
+diff -ruN pa/uxplay.cpp pb/uxplay.cpp
+--- pa/uxplay.cpp	2026-10-14 22:09:55.136830100 +0200
++++ pb/uxplay.cpp	2026-10-14 22:10:42.534690600 +0200
+@@ -42,6 +42,7 @@
+ #include <winsock2.h>
+ #include <iphlpapi.h>
+ #include <pthread.h>   //for pthreads in MSYS2 UCRT
++#include "netstats.h"
+ #else
+ #include <csignal>
+ #include <glib-unix.h>
+@@ -108,6 +109,7 @@
+ static std::string videosink_options = "";
+ static videoflip_t videoflip[2] = { NONE , NONE };
+ static bool use_video = true;
++static bool net_stats_enabled = false;   /* -stats: print a STATS line (data rates) every second */
+ static unsigned char compression_type = 0;
+ static std::string audiosink = "autoaudiosink";
+ static int  audiodelay = -1;
+@@ -1359,6 +1361,8 @@
+             }
+         } else if (arg == "-a") {
+             use_audio = false;
++        } else if (arg == "-stats") {
++            net_stats_enabled = true;
+         } else if (arg == "-d") {
+             if (i < argc - 1 && *argv[i+1] != '-') {
+                 unsigned int n = 1;
+@@ -2222,6 +2226,28 @@
+     }
+ }
+ 
++/* Data-rate statistics: one "STATS" line per second (read by the OpenReceiver user interface) */
++static NetStats *net_stats = new NetStats();    /* never freed: also used while the process shuts down */
++
++static void *net_stats_thread(void *) {
++    uint64_t last = get_local_time();
++    for (;;) {
++        Sleep(1000);
++        uint64_t now = get_local_time();
++        double secs = (double) (now - last) / SECOND_IN_NSECS;
++        last = now;
++        unsigned int drop_sink = 0, drop_dec = 0;
++        if (use_video) video_renderer_get_drops(&drop_sink, &drop_dec);
++        std::string line = net_stats->line(secs, raop_stat_resend_requests, raop_stat_resend_empty, raop_stat_gaps_skipped,
++                                           drop_sink, drop_dec, open_connections);
++        if (!line.empty()) {
++            fprintf(stderr, "%s\n", line.c_str());
++            fflush(stderr);
++        }
++    }
++    return NULL;
++}
++
+ extern "C" void conn_init (void *cls) {
+     open_connections++;
+     LOGD("Open connections: %i", open_connections);
+@@ -2293,6 +2319,9 @@
+ }
+ 
+ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
++    if (net_stats_enabled) {
++        net_stats->audio(data->data_len, data->ntp_time_local ? (int64_t) data->ntp_time_local - (int64_t) get_local_time() : 0);
++    }
+     if (dump_audio) {
+         dump_audio_to_file(data->data, data->data_len, (data->data)[0] & 0xf0);
+     }
+@@ -2328,6 +2357,9 @@
+ }
+ 
+ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
++    if (net_stats_enabled) {
++        net_stats->video(data->data_len, data->ntp_time_local ? (int64_t) data->ntp_time_local - (int64_t) get_local_time() : 0);
++    }
+     if (dump_video) {
+         dump_video_to_file(data->data, data->data_len);
+     }
+@@ -2757,6 +2789,11 @@
+     raop_start_httpd(raop, &raop_port);
+     raop_set_port(raop, raop_port);
+ 
++    if (net_stats_enabled) {
++        pthread_t stats_tid;
++        if (pthread_create(&stats_tid, NULL, net_stats_thread, NULL) == 0) pthread_detach(stats_tid);
++    }
++
+     /* use raop_port for airplay_port (instead of tcp[2]) */
+     airplay_port = raop_port;
+ 

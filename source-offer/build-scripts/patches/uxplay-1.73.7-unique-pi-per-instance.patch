@@ -1,0 +1,36 @@
+--- a/lib/dnssd.c
++++ b/lib/dnssd.c
+@@ -392,7 +392,15 @@
+     }
+     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "model", strlen(GLOBAL_MODEL), GLOBAL_MODEL);
+     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "pk", strlen(dnssd->pk), dnssd->pk);
+-    dnssd->TXTRecordSetValue(&dnssd->airplay_record, "pi", strlen(AIRPLAY_PI), AIRPLAY_PI);
++    /* AIRPLAY_PI is a fixed constant, identical for every UxPlay instance: harmless alone, but it makes several
++       concurrent instances (see -m/-p, used for several iPhones at once) look like the SAME receiver to a client,
++       which then shows only one of their names for all of them. Derive a distinct one per instance from its own
++       (already-unique) hardware address instead, keeping the same, already-used prefix/format. */
++    char pi_str[48];
++    snprintf(pi_str, sizeof(pi_str), "2e388006-13ba-4041-9a67-%02x%02x%02x%02x%02x%02x",
++             (unsigned char) dnssd->hw_addr[0], (unsigned char) dnssd->hw_addr[1], (unsigned char) dnssd->hw_addr[2],
++             (unsigned char) dnssd->hw_addr[3], (unsigned char) dnssd->hw_addr[4], (unsigned char) dnssd->hw_addr[5]);
++    dnssd->TXTRecordSetValue(&dnssd->airplay_record, "pi", strlen(pi_str), pi_str);
+     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "srcvers", strlen(AIRPLAY_SRCVERS), AIRPLAY_SRCVERS);
+     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "vv", strlen(AIRPLAY_VV), AIRPLAY_VV);
+
+--- a/lib/raop_handlers.h
++++ b/lib/raop_handlers.h
+@@ -139,7 +139,13 @@
+     plist_t name_node = plist_new_string(name);
+     plist_dict_set_item(res_node, "name", name_node);
+
+-    plist_t pi_node = plist_new_string(AIRPLAY_PI);
++    /* Same per-instance "pi" as in the TXT record (see dnssd_register_airplay) - must match, kept in sync by deriving
++       it the same way from the hardware address, which is already fetched above as hw_addr_raw. */
++    char pi_str[48];
++    snprintf(pi_str, sizeof(pi_str), "2e388006-13ba-4041-9a67-%02x%02x%02x%02x%02x%02x",
++             (unsigned char) hw_addr_raw[0], (unsigned char) hw_addr_raw[1], (unsigned char) hw_addr_raw[2],
++             (unsigned char) hw_addr_raw[3], (unsigned char) hw_addr_raw[4], (unsigned char) hw_addr_raw[5]);
++    plist_t pi_node = plist_new_string(pi_str);
+     plist_dict_set_item(res_node, "pi", pi_node);
+
+     plist_t vv_node = plist_new_uint(strtol(AIRPLAY_VV, NULL, 10));

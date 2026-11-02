@@ -1,0 +1,15 @@
+--- a/lib/fairplay_playfair.c	2026-09-04 18:10:54.000000000 +0200
++++ b/lib/fairplay_playfair.c	2026-11-02 17:41:05.338206500 +0100
+@@ -56,6 +56,12 @@
+     }
+ 
+     int mode = req[14];
++    if (mode < 0 || mode > 3) {
++        /* req[14] is a byte the connecting client chooses freely (0-255); reply_message only has 4 rows.
++           Without this check, an out-of-range mode reads far past the array and returns that memory to the
++           client as the HTTP response body - before any pairing/PIN check, reachable by any device on the LAN. */
++        return -1;
++    }
+     memcpy(res, reply_message[mode], 142);
+     fp->keymsglen = 0;
+     return 0;

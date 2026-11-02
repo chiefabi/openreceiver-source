@@ -1,0 +1,20 @@
+--- a/lib/raop_rtp_mirror.c
++++ b/lib/raop_rtp_mirror.c
+@@ -324,6 +324,17 @@
+ 
+             /*packet[0:3] contains the payload size */
+             int payload_size = byteutils_get_int(packet, 0);
++            /* This is an attacker-controlled 32-bit value from the TCP mirror-data stream, read before any
++             * length sanity check existed: a negative or implausibly large value reached malloc()/recv() further
++             * below unchecked, causing either a NULL-pointer payload buffer to be used (malloc failure on a huge
++             * or negative-as-size_t request) or multi-gigabyte allocations per connection (memory exhaustion).
++             * Even an uncompressed 4K video frame region does not need anywhere near this much per mirror packet. */
++            if (payload_size < 0 || payload_size > 16 * 1024 * 1024) {
++                logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
++                           "raop_rtp_mirror received implausible payload_size %d in mirror data header, closing connection",
++                           payload_size);
++                break;
++            }
+             char packet_description[13] = {0};
+             char *p = packet_description;
+             int n = sizeof(packet_description);
